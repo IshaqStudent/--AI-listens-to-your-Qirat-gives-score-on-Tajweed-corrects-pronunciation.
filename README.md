@@ -1,0 +1,1 @@
+# --AI-listens-to-your-Qirat-gives-score-on-Tajweed-corrects-pronunciation.

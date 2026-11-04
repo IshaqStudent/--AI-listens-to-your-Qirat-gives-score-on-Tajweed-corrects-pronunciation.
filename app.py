@@ -5,6 +5,7 @@ lists mistakes with timestamps, and suggests pronunciation corrections.
 """
 
 import html
+import io
 import json
 import os
 import re
@@ -22,7 +23,7 @@ except ImportError:  # pragma: no cover - shown in UI if package is missing
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 MAX_AUDIO_MB = 15  # inline upload limit stays safely under Gemini's request cap
 
 MIME_TYPES = {
@@ -189,35 +190,120 @@ def grade_label(score: int | None) -> str:
 # ----------------------------------------------------------------------------
 # Gemini call
 # ----------------------------------------------------------------------------
-def analyze_recitation(api_key, model, audio_bytes, mime_type, riwayah, strictness, reference_text) -> dict:
-    if genai is None:
-        raise RuntimeError("The 'google-genai' package is not installed. Run: pip install -r requirements.txt")
+# Errors that mean "this model name is wrong/retired" -> try another model
+MODEL_ERROR_MARKERS = ("404", "NOT_FOUND", "no longer available", "is not found", "not supported for")
+# Errors that retrying can never fix (bad key, no permission, bad request)
+FATAL_ERROR_MARKERS = ("API key", "API_KEY_INVALID", "401", "403", "PERMISSION_DENIED", "UNAUTHENTICATED", "INVALID_ARGUMENT")
+# Model names we never want to auto-pick for audio analysis
+SKIP_WORDS = ("image", "tts", "live", "lite", "embedding", "robotics", "computer-use")
 
-    client = genai.Client(api_key=api_key)
+
+def is_model_error(exc: Exception) -> bool:
+    return any(marker in str(exc) for marker in MODEL_ERROR_MARKERS)
+
+
+def is_fatal_error(exc: Exception) -> bool:
+    return any(marker in str(exc) for marker in FATAL_ERROR_MARKERS)
+
+
+def _version_key(name: str) -> list:
+    numbers = re.findall(r"\d+(?:\.\d+)?", name)
+    return [float(n) for n in numbers] or [0.0]
+
+
+def pick_flash_models(names) -> list:
+    """From a list of model names, keep general 'flash' models, newest first."""
+    good = set()
+    for name in names:
+        clean = str(name).replace("models/", "", 1)
+        low = clean.lower()
+        if "flash" in low and not any(word in low for word in SKIP_WORDS):
+            good.add(clean)
+    return sorted(good, key=_version_key, reverse=True)
+
+
+def discover_flash_models(client) -> list:
+    """Ask the API which Flash models this key can use (used only after a 404)."""
+    try:
+        names = []
+        for model in client.models.list():
+            actions = getattr(model, "supported_actions", None)
+            if actions and "generateContent" not in actions:
+                continue
+            names.append(model.name)
+        return pick_flash_models(names)
+    except Exception:
+        return []
+
+
+def _generate_via_interactions(client, model, audio_bytes, mime_type, prompt) -> str:
+    """Fallback for models that only work with Google's newer Interactions API."""
+    uploaded = client.files.upload(file=io.BytesIO(audio_bytes), config={"mime_type": mime_type})
+    interaction = client.interactions.create(
+        model=model,
+        input=[
+            {"type": "text", "text": SYSTEM_PROMPT + "\n\n" + prompt},
+            {"type": "audio", "uri": uploaded.uri, "mime_type": mime_type},
+        ],
+    )
+    return interaction.output_text
+
+
+def _generate_once(client, model, audio_bytes, mime_type, prompt) -> str:
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
         temperature=0.2,
     )
-    contents = [
-        types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-        build_user_prompt(riwayah, strictness, reference_text),
-    ]
+    contents = [types.Part.from_bytes(data=audio_bytes, mime_type=mime_type), prompt]
+    try:
+        response = client.models.generate_content(model=model, contents=contents, config=config)
+        return response.text
+    except Exception as exc:
+        if hasattr(client, "interactions") and "interaction" in str(exc).lower():
+            return _generate_via_interactions(client, model, audio_bytes, mime_type, prompt)
+        raise
 
+
+def analyze_recitation(api_key, model, audio_bytes, mime_type, riwayah, strictness, reference_text) -> dict:
+    if genai is None:
+        raise RuntimeError("The 'google-genai' package is not installed. Run: pip install -r requirements.txt")
+
+    client = genai.Client(api_key=api_key)
+    prompt = build_user_prompt(riwayah, strictness, reference_text)
+
+    candidates = [model.strip() or DEFAULT_MODEL]
+    discovered = False
     last_error = None
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(model=model, contents=contents, config=config)
-            return normalize_result(extract_json(response.text))
-        except ValueError as exc:  # bad / empty JSON -> retry
-            last_error = exc
-        except Exception as exc:  # network, quota, auth ...
-            message = str(exc)
-            if any(code in message for code in ("API key", "401", "403", "PERMISSION_DENIED", "INVALID_ARGUMENT")):
-                raise
-            last_error = exc
-        time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Analysis failed after 3 attempts: {last_error}")
+    index = 0
+    while index < len(candidates):
+        current = candidates[index]
+        index += 1
+        for attempt in range(3):
+            try:
+                text = _generate_once(client, current, audio_bytes, mime_type, prompt)
+                result = normalize_result(extract_json(text))
+                result["model_used"] = current
+                return result
+            except ValueError as exc:  # bad / empty JSON -> retry same model
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+                if is_model_error(exc):
+                    # Model retired/unknown: look up working Flash models once, then move on
+                    if not discovered:
+                        discovered = True
+                        for name in discover_flash_models(client)[:4]:
+                            if name not in candidates:
+                                candidates.append(name)
+                    break
+                if is_fatal_error(exc):
+                    raise
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(
+        f"Analysis failed: {str(last_error).rstrip('.')}. If this is a model error, type a currently available "
+        "Gemini Flash model name in the sidebar (see https://ai.google.dev/gemini-api/docs/models)."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -245,6 +331,8 @@ def show_results(result: dict) -> None:
 
     if result["summary"]:
         st.info(result["summary"])
+    if result.get("model_used"):
+        st.caption(f"Analyzed with {result['model_used']}")
 
     if result["detected_text"]:
         st.markdown("**Detected recitation**")

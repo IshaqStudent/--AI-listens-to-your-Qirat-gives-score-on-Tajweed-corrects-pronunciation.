@@ -1,4 +1,3 @@
-# --AI-listens-to-your-Qirat-gives-score-on-Tajweed-corrects-pronunciation.
 # 📖 Qirat Tajweed Checker
 
 Upload or record your Quran recitation. AI (Google Gemini Flash) listens, gives a
@@ -35,7 +34,7 @@ Get a free API key at https://aistudio.google.com/apikey (or paste it in the app
 
 ## Notes
 - Max upload: 15 MB. Use clear audio with little background noise.
-- Change the model with the `GEMINI_MODEL` environment variable or the sidebar (default: `gemini-2.5-flash`).
+- Change the model with the `GEMINI_MODEL` environment variable or the sidebar (default: `gemini-3.8-flash`; the app also auto-switches to another available Flash model if the default is ever retired).
 
 ## Files
 - `app.py` – Streamlit app and Gemini logic

@@ -192,6 +192,9 @@ def grade_label(score: int | None) -> str:
 # ----------------------------------------------------------------------------
 # Errors that mean "this model name is wrong/retired" -> try another model
 MODEL_ERROR_MARKERS = ("404", "NOT_FOUND", "no longer available", "is not found", "not supported for")
+# Temporary overload / rate limit -> wait and retry, then try another model
+BUSY_ERROR_MARKERS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded", "high demand", "INTERNAL", "DEADLINE_EXCEEDED", "timed out")
+MAX_ATTEMPTS = 4  # per model; waits 2s, 4s, 8s between attempts
 # Errors that retrying can never fix (bad key, no permission, bad request)
 FATAL_ERROR_MARKERS = ("API key", "API_KEY_INVALID", "401", "403", "PERMISSION_DENIED", "UNAUTHENTICATED", "INVALID_ARGUMENT")
 # Model names we never want to auto-pick for audio analysis
@@ -200,6 +203,10 @@ SKIP_WORDS = ("image", "tts", "live", "lite", "embedding", "robotics", "computer
 
 def is_model_error(exc: Exception) -> bool:
     return any(marker in str(exc) for marker in MODEL_ERROR_MARKERS)
+
+
+def is_busy_error(exc: Exception) -> bool:
+    return any(marker in str(exc) for marker in BUSY_ERROR_MARKERS)
 
 
 def is_fatal_error(exc: Exception) -> bool:
@@ -265,9 +272,14 @@ def _generate_once(client, model, audio_bytes, mime_type, prompt) -> str:
         raise
 
 
-def analyze_recitation(api_key, model, audio_bytes, mime_type, riwayah, strictness, reference_text) -> dict:
+def analyze_recitation(api_key, model, audio_bytes, mime_type, riwayah, strictness, reference_text, status_callback=None) -> dict:
+    """Send the audio to Gemini. Retries busy servers with back-off and tries other Flash models."""
     if genai is None:
         raise RuntimeError("The 'google-genai' package is not installed. Run: pip install -r requirements.txt")
+
+    def say(message: str) -> None:
+        if status_callback:
+            status_callback(message)
 
     client = genai.Client(api_key=api_key)
     prompt = build_user_prompt(riwayah, strictness, reference_text)
@@ -275,31 +287,56 @@ def analyze_recitation(api_key, model, audio_bytes, mime_type, riwayah, strictne
     candidates = [model.strip() or DEFAULT_MODEL]
     discovered = False
     last_error = None
+    last_was_busy = False
     index = 0
+
+    def add_alternatives() -> None:
+        nonlocal discovered
+        if not discovered:
+            discovered = True
+            for name in discover_flash_models(client)[:4]:
+                if name not in candidates:
+                    candidates.append(name)
+
     while index < len(candidates):
         current = candidates[index]
         index += 1
-        for attempt in range(3):
+        for attempt in range(MAX_ATTEMPTS):
             try:
                 text = _generate_once(client, current, audio_bytes, mime_type, prompt)
                 result = normalize_result(extract_json(text))
                 result["model_used"] = current
                 return result
             except ValueError as exc:  # bad / empty JSON -> retry same model
-                last_error = exc
+                last_error, last_was_busy = exc, False
             except Exception as exc:
                 last_error = exc
-                if is_model_error(exc):
-                    # Model retired/unknown: look up working Flash models once, then move on
-                    if not discovered:
-                        discovered = True
-                        for name in discover_flash_models(client)[:4]:
-                            if name not in candidates:
-                                candidates.append(name)
+                if is_model_error(exc):  # model retired/unknown -> next model
+                    last_was_busy = False
+                    add_alternatives()
                     break
-                if is_fatal_error(exc):
+                if is_busy_error(exc):  # temporary overload -> wait and retry
+                    last_was_busy = True
+                elif is_fatal_error(exc):
                     raise
-            time.sleep(2 * (attempt + 1))
+                else:
+                    last_was_busy = False
+            if attempt < MAX_ATTEMPTS - 1:
+                wait = 2 * (2 ** attempt)
+                say(f"Gemini is busy. Retrying in {wait}s ... (attempt {attempt + 2}/{MAX_ATTEMPTS})")
+                time.sleep(wait)
+        else:
+            # All attempts on this model failed with a temporary error: look for another model
+            if last_was_busy:
+                add_alternatives()
+                if index < len(candidates):
+                    say(f"{current} is overloaded. Trying {candidates[index]} ...")
+
+    if last_was_busy:
+        raise RuntimeError(
+            "Google's Gemini servers are overloaded right now (temporary, not a problem with your file or key). "
+            "Please wait a minute and press Analyze again."
+        )
     raise RuntimeError(
         f"Analysis failed: {str(last_error).rstrip('.')}. If this is a model error, type a currently available "
         "Gemini Flash model name in the sidebar (see https://ai.google.dev/gemini-api/docs/models)."
@@ -432,14 +469,17 @@ def main() -> None:
         elif len(audio_bytes) < 2000:
             st.error("The audio is too short. Please record a longer recitation.")
         else:
+            status = st.empty()
             with st.spinner(f"Listening to {source_name} ..."):
                 try:
                     st.session_state["result"] = analyze_recitation(
-                        api_key, model, audio_bytes, mime_type, riwayah, strictness, reference_text
+                        api_key, model, audio_bytes, mime_type, riwayah, strictness, reference_text,
+                        status_callback=lambda message: status.info(message),
                     )
                 except Exception as exc:
                     st.session_state.pop("result", None)
                     st.error(f"Something went wrong: {exc}")
+            status.empty()
 
     if "result" in st.session_state:
         show_results(st.session_state["result"])

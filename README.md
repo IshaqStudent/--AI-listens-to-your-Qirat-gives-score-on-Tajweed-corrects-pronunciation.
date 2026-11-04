@@ -36,6 +36,11 @@ Get a free API key at https://aistudio.google.com/apikey (or paste it in the app
 - Max upload: 15 MB. Use clear audio with little background noise.
 - Change the model with the `GEMINI_MODEL` environment variable or the sidebar (default: `gemini-3.8-flash`; the app also auto-switches to another available Flash model if the default is ever retired).
 
+## Troubleshooting
+- **503 UNAVAILABLE / high demand:** Google's servers are temporarily busy. The app retries automatically and switches to another Flash model; if it still fails, wait a minute and press Analyze again.
+- **429 / quota:** you hit the free-tier rate limit; wait a bit or use a key with more quota.
+- **404 model not found:** type a current Gemini Flash model name in the sidebar.
+
 ## Files
 - `app.py` – Streamlit app and Gemini logic
 - `requirements.txt` – dependencies
